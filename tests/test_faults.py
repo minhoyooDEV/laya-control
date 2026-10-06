@@ -2,6 +2,8 @@
 
 import multiprocessing as mp
 import os
+import subprocess
+import sys
 import time
 import unittest
 from unittest.mock import patch
@@ -9,7 +11,7 @@ from unittest.mock import patch
 import test_jobs
 import test_releases
 
-from laya_control.jobs import cancel, work
+from laya_control.jobs import cancel, identity, work
 from laya_control.releases import activate, recover_activation
 from laya_control.store import Store
 
@@ -120,3 +122,30 @@ class FaultTests(unittest.TestCase):
             if p.is_alive():
                 p.terminate()
                 p.join(5)
+
+    def test_identity_survives_exec(self):
+        before = self.root / "before"
+        proceed = self.root / "proceed"
+        after = self.root / "after"
+        second = f"from pathlib import Path; import time; Path({str(after)!r}).touch(); time.sleep(10)"
+        first = (
+            f"import os,sys,time; from pathlib import Path; Path({str(before)!r}).touch(); "
+            f"\nwhile not Path({str(proceed)!r}).exists(): time.sleep(.01)\n"
+            f"os.execv(sys.executable,[sys.executable,'-c',{second!r}])"
+        )
+        child = subprocess.Popen([sys.executable, "-c", first])
+        try:
+            deadline = time.monotonic() + 5
+            while not before.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(before.exists())
+            old = identity(child.pid)
+            self.assertIsNotNone(old)
+            proceed.touch()
+            while not after.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(after.exists())
+            self.assertEqual(identity(child.pid), old)
+        finally:
+            child.terminate()
+            child.wait(timeout=5)

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
 import fcntl
 import hashlib
 import json
 import os
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -38,10 +40,43 @@ def lock_file(path, blocking=False):
 
 
 def identity(pid):
-    p = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="], capture_output=True, text=True, check=False
-    )
-    return p.stdout.strip() if p.returncode == 0 else None
+    """OS birth identity, stable across exec and independent of mutable argv."""
+    if sys.platform == "darwin":
+        # Darwin proc_bsdinfo from sys/proc_info.h (PROC_PIDTBSDINFO = 3).
+        class BsdInfo(ctypes.Structure):
+            _fields_ = [
+                ("ids", ctypes.c_uint32 * 12),
+                ("comm", ctypes.c_char * 16),
+                ("name", ctypes.c_char * 32),
+                ("details", ctypes.c_uint32 * 6),
+                ("seconds", ctypes.c_uint64),
+                ("microseconds", ctypes.c_uint64),
+            ]
+
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        info = BsdInfo()
+        lib.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        size = lib.proc_pidinfo(int(pid), 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+        if size != ctypes.sizeof(info) or info.ids[1] == 5:  # SZOMB
+            return None
+        return f"darwin:{pid}:{info.seconds}:{info.microseconds}"
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{int(pid)}/stat").read_text()
+            fields = stat[stat.rfind(")") + 2 :].split()
+            if fields[0] == "Z":
+                return None
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            return f"linux:{pid}:{boot}:{fields[19]}"
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+    raise ControlError("process identity is only supported on macOS and Linux")
 
 
 def artifact_hashes(directory):
@@ -174,7 +209,7 @@ def work(store, lock_root=None, drain=False):
                             cancelling = db.execute("SELECT cancel FROM jobs WHERE id=?", (jid,)).fetchone()[
                                 0
                             ]
-                        if cancelling and identity(child.pid) == started:
+                        if cancelling and started is not None and identity(child.pid) == started:
                             if stop_at is None:
                                 os.killpg(child.pid, signal.SIGTERM)
                                 stop_at = time.monotonic()
@@ -225,7 +260,11 @@ def recover(store, lock_root=None):
         with store.tx() as db:
             rows = db.execute("SELECT * FROM jobs WHERE state IN ('running','evaluating')").fetchall()
             for row in rows:
-                if row["pid"] and identity(row["pid"]) == row["start_identity"]:
+                if (
+                    row["pid"]
+                    and row["start_identity"] is not None
+                    and identity(row["pid"]) == row["start_identity"]
+                ):
                     return {"state": "identity_alive"}
             for row in rows:
                 state = "cancelled" if row["cancel"] else "interrupted"
