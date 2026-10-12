@@ -339,3 +339,39 @@ def activate_remote(store: Store, remote: Remote, job_id, reason):
         "evaluation": verdict,
         "data_deleted": record["data_deleted"],
     }
+
+
+
+
+def remote_status(root, factory) -> dict:
+    """Remote jobs submitted from this state root, with live server state; creates nothing."""
+    directory = absolute(root) / "remote"
+    records = sorted(
+        (json.loads(p.read_text()) for p in directory.glob("*.json")) if directory.is_dir() else [],
+        key=lambda r: r["submitted_at"],
+    )
+    remote, unavailable = None, None
+    if records:
+        try:
+            remote = factory()
+        except ControlError as exc:
+            unavailable = str(exc)
+    jobs = []
+    for record in records:
+        entry = {
+            "id": record["job_id"],
+            "task": record["task"],
+            "snapshot_id": record["snapshot_id"],
+            "owner": record["owner"],
+            "activated": bool(record.get("activation")),
+        }
+        try:
+            if remote is None:
+                raise ControlError(unavailable)
+            job = call(remote.client.job, record["job_id"])
+            entry.update({k: job.get(k) for k in ("step", "total", "wait_reason", "version")})
+            entry["state"] = job.get("status")
+        except ControlError as exc:
+            entry.update(state="unavailable", error=str(exc))
+        jobs.append(entry)
+    return {"jobs": jobs}
