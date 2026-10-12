@@ -45,6 +45,8 @@ laya-control snapshot --authorization-id AUTH_ID --base-revision BASE_TREE_SHA25
 laya-control train --snapshot SNAPSHOT_ID --base /tmp/cached-base --python /tmp/training-env/bin/python --config /tmp/policy.json --owner session-a --request-id train-request-1
 laya-control worker --drain
 laya-control status --json
+laya-control train --remote --snapshot SNAPSHOT_ID --config /tmp/policy.json --owner session-a --request-id train-request-2
+laya-control status --remote
 ```
 
 `train` queues; `worker` executes. Drain captures already authorized queued jobs.

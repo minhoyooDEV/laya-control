@@ -53,6 +53,40 @@ An adapter must provide meaningful evidence. The controller verifies exit status
 artifacts and lineage but cannot attest arbitrary executable behavior. Use the
 built-in adapter for its documented evaluation checks.
 
+## Remote training
+
+`train --remote` sends the snapshot's four splits to a shared Laya server instead of
+queuing a local job. The client library comes from a laya-poc checkout: set
+`LAYA_POC_HOME` (default `~/Documents/laya-poc`, `client/` must exist) and
+`LAYA_SERVER_URL` (default `http://127.0.0.1:7650`).
+
+```sh
+laya-control train --remote --snapshot SNAPSHOT_ID --config /tmp/policy.json --owner session-a --request-id train-request-1
+laya-control status --remote
+laya-control activate --remote --run-id REMOTE_JOB_ID --reason 'Apply reviewed candidate'
+```
+
+Only task `compact-laya-focus-v2` is supported. The command refuses to upload when the
+server's `/v1/status` `base.files` digest differs from the snapshot `base_revision`, or
+when the registered task schema differs from the snapshot schema. From the config
+`train` object only `epochs`, `micro_batch`, `grad_accum`, `freeze_encoder` and `seed`
+are sent; other keys are reported as `ignored_train_keys`. `device`, `mlx_python` and
+`--python`/`--base` are not used. `policy` is frozen into the job record at submit time.
+
+`activate --remote` takes the finished job's server metrics and applies the same policy
+as local runs against the base model, on dev and then, only if dev passed, on test:
+`min_accuracy`, per-class recall regression (`max_regression`), and rejection on any
+calibration issue, `temperature_at_bound` or failed parity. A dev-rejected job's test
+metrics are never read. Only a passing job is activated on the server. Once the decision
+is recorded locally (accepted or rejected), the job's server-side split data is deleted
+with `delete_job_data`; a failed delete is recorded and does not undo the decision. Generation and data-coverage checks are local-release features and do
+not apply. Per-class recall keys follow the local form (`edit:True`, `edit:False` for
+boolean questions).
+
+A request ID is recorded before the upload. If the process dies mid-upload, the same
+request ID is refused until the server job list is checked; use a new request ID to
+submit again. Remote job records live under `<state-root>/remote/`.
+
 ## Serving and status
 
 One JSON request per Unix connection; 1 MiB limit; 5-second input timeout.
