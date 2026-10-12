@@ -195,3 +195,86 @@ def submit_remote(store: Store, remote: Remote, snapshot_id, cfg, owner, request
         "remote": True,
         "ignored_train_keys": ignored,
     }
+
+
+
+
+def to_score(metric, questions) -> dict:
+    """Map a server metric M to the shape passes_policy expects.
+
+    Accuracy is the mean of per-question accuracies (every question has the same item count, so this
+    equals the pooled accuracy). Recall keys follow score_predictions: "<qid>:<expected>", where a noul
+    expectation is a Python bool, so the server labels "true"/"false" become "True"/"False".
+    """
+    try:
+        items = metric["items"]
+        by_question = metric["questions"]
+        if isinstance(items, bool) or not isinstance(items, int) or items < 1:
+            raise ControlError("metrics report no evaluated items")
+        if set(by_question) != set(questions):
+            raise ControlError("metrics questions differ from the snapshot schema")
+        accuracies, recall = [], {}
+        for qid, definition in questions.items():
+            kind = definition["type"]
+            accuracies.append(float(by_question[qid]["accuracy"]))
+            for label, value in by_question[qid]["recall"].items():
+                if kind == "noul" and label in ("true", "false"):
+                    name = f"{qid}:{label == 'true'}"
+                elif kind == "choice":
+                    name = f"{qid}:{label}"
+                else:
+                    raise ControlError("remote gate supports choice and noul only")
+                recall[name] = float(value)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise ControlError("malformed remote metrics") from None
+    if not recall:
+        raise ControlError("metrics have no per-class recall; the regression gate would be vacuous")
+    if not all(math.isfinite(x) for x in [*accuracies, *recall.values()]):
+        raise ControlError("non-finite remote metrics")
+    return {
+        "accuracy": sum(accuracies) / len(accuracies),
+        "count": items * len(questions),
+        "per_class_recall": recall,
+        "confusion": {},
+    }
+
+
+def evaluate(job, questions, policy) -> dict:
+    """The promotion gate for a finished remote job: candidate vs base on dev, then on test only if dev
+    passed, plus the calibration, temperature-bound and parity rules the local adapter applies."""
+    metrics = job.get("metrics")
+    if job.get("status") != "ready" or not isinstance(metrics, dict):
+        return {"passed": False, "reasons": ["job is not ready"], "splits": {}}
+    reasons = []
+    if metrics.get("temperature_at_bound") is not False:
+        reasons.append("temperature at bound")
+    calibration = metrics.get("calibration")
+    if not isinstance(calibration, dict) or not calibration:
+        reasons.append("calibration report missing")
+    else:
+        reasons += [
+            f"calibration issue: {kind}" for kind, entry in calibration.items() if entry.get("issues")
+        ]
+    parity = metrics.get("parity")
+    if not isinstance(parity, dict) or parity.get("passed") is not True:
+        reasons.append("parity not passed")
+    results = {}
+    for split in ("dev", "test"):
+        # The sealed test metrics are read only after dev passed, as in the local flow.
+        if split == "test" and not results["dev"]["passed"]:
+            break
+        entry = (metrics.get("splits") or {}).get(split)
+        if not isinstance(entry, dict) or not entry.get("candidate") or not entry.get("base"):
+            reasons.append(f"{split} metrics missing")
+            break
+        baseline = to_score(entry["base"], questions)
+        candidate = to_score(entry["candidate"], questions)
+        ok = passes_policy(baseline, candidate, policy)
+        results[split] = {
+            "baseline_accuracy": baseline["accuracy"],
+            "candidate_accuracy": candidate["accuracy"],
+            "passed": ok,
+        }
+        if not ok:
+            reasons.append(f"{split} policy not met")
+    return {"passed": not reasons, "reasons": reasons, "splits": results}
