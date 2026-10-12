@@ -117,3 +117,81 @@ def map_config(train):
         raise ControlError("train config must be an object")
     kept = {k: train[k] for k in REMOTE_TRAIN_KEYS if k in train}
     return kept, sorted(set(train) - set(REMOTE_TRAIN_KEYS))
+
+
+
+
+def record_path(root, job_id) -> Path:
+    if not isinstance(job_id, str) or not JOB_ID.fullmatch(job_id):
+        raise ControlError("remote job id must be 12 hex characters")
+    return absolute(root) / "remote" / f"{job_id}.json"
+
+
+def load_record(root, job_id) -> dict:
+    path = record_path(root, job_id)
+    if not path.is_file():
+        raise ControlError("unknown remote job; it was not submitted from this state root")
+    return json.loads(path.read_text())
+
+
+def submit_remote(store: Store, remote: Remote, snapshot_id, cfg, owner, request_id):
+    """Send the snapshot splits to the server. The request marker is written before the call so a crash
+    between the call and the record never causes a silent second submission."""
+    if not owner or not request_id:
+        raise ControlError("owner and request ID required")
+    if not isinstance(cfg, dict):
+        raise ControlError("config must be an object")
+    policy = cfg.get("policy", {})
+    if not isinstance(policy, dict):
+        raise ControlError("policy must be an object")
+    config, ignored = map_config(cfg.get("train", {}))
+    snapshot = store.get_snapshot(snapshot_id)
+    with store.connect(readonly=True) as db:
+        store.validate_labels(snapshot, db)
+    questions = snapshot_questions(snapshot)
+    payload_hash = digest([snapshot_id, config, policy, owner])
+    marker = store.root / "remote" / "requests" / (digest(request_id) + ".json")
+    if marker.is_file():
+        old = json.loads(marker.read_text())
+        if old["payload_hash"] != payload_hash:
+            raise ControlError("remote request ID reused with changed content")
+        if not old["job_id"]:
+            raise ControlError(
+                "earlier submission outcome unknown; check the server job list before retrying"
+            )
+        return {"id": old["job_id"], "state": "submitted", "remote": True}
+    check_base(snapshot, call(remote.client.status))
+    tasks = call(remote.client.tasks)
+    registered = next((t for t in tasks if t.get("task") == REMOTE_TASK), None)
+    if registered is None:
+        call(remote.client.put_task, REMOTE_TASK, REMOTE_OWNER, questions, "compact-laya focus decisions")
+    elif registered.get("schema_hash") != schema_hash(questions):
+        raise ControlError("server task schema differs from the snapshot schema; not submitting")
+    splits, counts = build_splits(snapshot, remote.rows_to_jsonl)
+    atomic_json(marker, {"payload_hash": payload_hash, "job_id": None})
+    response = call(remote.client.submit_job, REMOTE_TASK, splits, config)
+    job_id = response["job_id"]
+    record = {
+        "job_id": job_id,
+        "task": REMOTE_TASK,
+        "snapshot_id": snapshot_id,
+        "owner": owner,
+        "request_id": request_id,
+        "schema_hash": schema_hash(questions),
+        "config": config,
+        "ignored_train_keys": ignored,
+        "policy": policy,
+        "split_counts": counts,
+        "submitted_at": time.time(),
+        "activation": None,
+    }
+    atomic_json(record_path(store.root, job_id), record)
+    atomic_json(marker, {"payload_hash": payload_hash, "job_id": job_id})
+    with store.tx() as db:
+        store.event(db, "remote_submitted", job_id, {"snapshot_id": snapshot_id})
+    return {
+        "id": job_id,
+        "state": response.get("status", "queued"),
+        "remote": True,
+        "ignored_train_keys": ignored,
+    }
