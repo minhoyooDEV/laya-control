@@ -46,9 +46,12 @@ def compare(reference, actual, tolerance=0.03):
 
 
 def main():
+    import mlx.core as mx
     import laya_mlx
     from laya_mlx.convert import convert
 
+    # MLX keeps freed Metal buffers without a bound; ~100 predictions grew the cache to 35 GiB and exhausted a 48 GB Mac.
+    mx.set_cache_limit(1 << 30)
     out = absolute(sys.argv[1])
     convert(str(out / "model"), str(out / "mlx"))
     data = json.loads((out / "parity-input.json").read_text())
