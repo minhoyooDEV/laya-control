@@ -69,3 +69,51 @@ def call(function, *args, **kwargs):
         if "LayaPocError" in names:
             raise ControlError("remote server unavailable") from None
         raise
+
+
+
+
+def schema_hash(questions) -> str:
+    """The server's schema hash: sha256 of canonical question JSON, first 16 hex characters."""
+    return hashlib.sha256(canonical(questions).encode()).hexdigest()[:16]
+
+
+def check_base(snapshot, status) -> None:
+    """Refuse unless the server's base files hash to the snapshot's pinned base_revision."""
+    files = (status.get("base") or {}).get("files")
+    if (
+        not isinstance(files, dict)
+        or not files
+        or not all(isinstance(k, str) and isinstance(v, str) for k, v in files.items())
+    ):
+        raise ControlError("server status has no base file hashes")
+    if digest(files) != snapshot["base_revision"]:
+        raise ControlError("server base checkpoint differs from the snapshot base_revision; not submitting")
+
+
+def snapshot_questions(snapshot) -> dict:
+    """The one question schema of a remote-trainable snapshot; other tasks are refused."""
+    examples = list(snapshot["examples"].values())
+    if not examples or any(e["task_id"] != REMOTE_TASK for e in examples):
+        raise ControlError(f"remote training supports only task {REMOTE_TASK}")
+    return examples[0]["schema"]
+
+
+def build_splits(snapshot, rows_to_jsonl):
+    """JSONL text and row counts for the four splits; test is the sealed benchmark."""
+    splits, counts = {}, {}
+    for name in SPLITS:
+        rows = rows_for(snapshot, name)
+        if not rows:
+            raise ControlError("all four confirmed splits are required")
+        splits[name] = rows_to_jsonl(rows)
+        counts[name] = len(rows)
+    return splits, counts
+
+
+def map_config(train):
+    """Keep the five keys the server accepts; report the rest as ignored."""
+    if not isinstance(train, dict):
+        raise ControlError("train config must be an object")
+    kept = {k: train[k] for k in REMOTE_TRAIN_KEYS if k in train}
+    return kept, sorted(set(train) - set(REMOTE_TRAIN_KEYS))
