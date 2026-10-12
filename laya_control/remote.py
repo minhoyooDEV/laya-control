@@ -278,3 +278,64 @@ def evaluate(job, questions, policy) -> dict:
         if not ok:
             reasons.append(f"{split} policy not met")
     return {"passed": not reasons, "reasons": reasons, "splits": results}
+
+
+def delete_data(remote: Remote, job, record, path) -> None:
+    """Delete the server-side split data once the decision is recorded locally. A failure here never
+    undoes the decision; it is recorded so the next run can retry."""
+    if job.get("data_deleted") is True:
+        record["data_deleted"] = True
+    else:
+        try:
+            call(remote.client.delete_job_data, record["job_id"])
+            record["data_deleted"] = True
+        except ControlError as exc:
+            record["data_deleted"] = False
+            record["data_delete_error"] = str(exc)
+    atomic_json(path, record)
+
+
+def activate_remote(store: Store, remote: Remote, job_id, reason):
+    """Gate a finished remote job with the local policy, then ask the server to activate its version."""
+    if not reason:
+        raise ControlError("explicit activation reason required")
+    record = load_record(store.root, job_id)
+    job = call(remote.client.job, job_id)
+    version = job.get("version")
+    if (
+        job.get("task") != record["task"]
+        or job.get("schema_hash") != record["schema_hash"]
+        or job.get("split_counts") != record["split_counts"]
+    ):
+        raise ControlError("remote job does not match the submitted snapshot")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ControlError("remote job has no trained version")
+    snapshot = store.get_snapshot(record["snapshot_id"])
+    with store.connect(readonly=True) as db:
+        store.validate_labels(snapshot, db)
+    verdict = evaluate(job, snapshot_questions(snapshot), record["policy"])
+    path = record_path(store.root, job_id)
+    decision = {"passed": verdict["passed"], "reasons": verdict["reasons"], "reason": reason, "at": time.time()}
+    terminal = job.get("status") == "ready"
+    if not verdict["passed"]:
+        if terminal:
+            record["decision"] = decision
+            atomic_json(path, record)
+            with store.tx() as db:
+                store.event(db, "remote_rejected", job_id, {"reasons": verdict["reasons"]})
+            delete_data(remote, job, record, path)
+        raise ControlError("remote evaluation gate not passed: " + "; ".join(verdict["reasons"]))
+    response = call(remote.client.activate, record["task"], version)
+    record["decision"] = decision
+    record["activation"] = {"version": version, "reason": reason, "at": decision["at"]}
+    atomic_json(path, record)
+    with store.tx() as db:
+        store.event(db, "remote_activated", job_id, {"version": version, "reason": reason})
+    delete_data(remote, job, record, path)
+    return {
+        "job_id": job_id,
+        "version": version,
+        "server": response,
+        "evaluation": verdict,
+        "data_deleted": record["data_deleted"],
+    }
