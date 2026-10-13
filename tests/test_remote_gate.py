@@ -1,4 +1,3 @@
-import copy
 import unittest
 
 from remote_fakes import QUESTIONS, SealedSplits, metric, ready_job
