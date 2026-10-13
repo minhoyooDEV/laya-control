@@ -45,19 +45,20 @@ class ActivateTests(unittest.TestCase):
     def saved(self):
         return json.loads((self.store.root / "remote" / f"{JOB_ID}.json").read_text())
 
-    def test_failing_gate_never_calls_activate_but_records_the_decision_and_deletes_data(self):
+    def deleted(self):
+        return [c for c in self.r.client.calls if c[0] == "delete_job_data"]
+
+    def test_failing_gate_never_calls_activate_and_records_the_rejection(self):
         job = self.put_job()
         job["metrics"]["parity"]["passed"] = False
         with self.assertRaises(ControlError) as caught:
             self.activate()
         self.assertIn("parity not passed", str(caught.exception))
-        names = [c[0] for c in self.r.client.calls]
-        self.assertNotIn("activate", names)
-        self.assertIn(("delete_job_data", JOB_ID), self.r.client.calls)
+        self.assertNotIn("activate", [c[0] for c in self.r.client.calls])
         saved = self.saved()
         self.assertFalse(saved["decision"]["passed"])
+        self.assertEqual(saved["decision"]["reasons"], ["parity not passed"])
         self.assertIsNone(saved["activation"])
-        self.assertTrue(saved["data_deleted"])
 
     def test_dev_rejected_job_decision_never_reads_the_test_split(self):
         job = self.put_job(candidate=0.6, base=0.5)
@@ -69,48 +70,54 @@ class ActivateTests(unittest.TestCase):
         self.assertEqual(splits.test_reads, 0)
         self.assertNotIn("activate", [c[0] for c in self.r.client.calls])
 
-    def test_decision_is_recorded_locally_before_server_data_is_deleted(self):
+    def test_server_data_is_kept_after_activation_and_after_rejection(self):
         self.put_job(version=2)
-        seen = []
-        self.r.client.on_delete = lambda job_id: seen.append(self.saved()["activation"])
         result = self.activate()
-        self.assertEqual(seen[0]["version"], 2)
-        self.assertTrue(result["data_deleted"])
-        self.assertTrue(self.saved()["data_deleted"])
-        names = [c[0] for c in self.r.client.calls]
-        self.assertLess(names.index("activate"), names.index("delete_job_data"))
+        self.assertEqual(self.deleted(), [])
+        self.assertNotIn("data_deleted", result)
+        self.assertNotIn("data_deleted", self.saved())
+        job = self.put_job()
+        job["metrics"]["parity"]["passed"] = False
+        with self.assertRaises(ControlError):
+            self.activate()
+        self.assertEqual(self.deleted(), [])
+        self.assertNotIn("data_deleted", self.saved())
 
-    def test_delete_failure_never_undoes_the_activation(self):
-        self.put_job(version=2)
-
-        def refuse(job_id):
-            raise ServerError(409, "job_active")
-
-        self.r.client.on_delete = refuse
+    def test_decision_record_and_result_carry_balanced_accuracies_and_warnings(self):
+        job = self.put_job(version=2)
+        job["metrics"]["temperature_at_bound"] = True
+        job["metrics"]["calibration"]["noul"]["issues"] = ["the fitted temperature 5 is on the [0.5, 5] clamp"]
         result = self.activate()
-        self.assertFalse(result["data_deleted"])
-        saved = self.saved()
-        self.assertEqual(saved["activation"]["version"], 2)
-        self.assertFalse(saved["data_deleted"])
-        self.assertIn("409 job_active", saved["data_delete_error"])
+        decision = self.saved()["decision"]
+        self.assertTrue(decision["passed"])
+        self.assertEqual(decision["warnings"], ["temperature on the clamp: noul", "temperature at bound"])
+        for split in ("dev", "test"):
+            table = decision["splits"][split]["balanced"]
+            self.assertEqual(set(table), {"edit", "pr"})
+            self.assertAlmostEqual(table["edit"]["candidate"], 0.9)
+            self.assertAlmostEqual(table["edit"]["base"], 0.8)
+        self.assertEqual(result["evaluation"]["warnings"], decision["warnings"])
+        self.assertEqual(result["evaluation"]["splits"]["dev"]["balanced"], decision["splits"]["dev"]["balanced"])
 
-    def test_already_deleted_data_is_not_deleted_again(self):
-        self.put_job(data_deleted=True)
-        self.assertTrue(self.activate()["data_deleted"])
-        self.assertNotIn("delete_job_data", [c[0] for c in self.r.client.calls])
+    def test_rejection_record_keeps_the_dev_table_and_no_test_table(self):
+        self.put_job(candidate=0.6, base=0.5)
+        with self.assertRaises(ControlError):
+            self.activate()
+        decision = self.saved()["decision"]
+        self.assertEqual(set(decision["splits"]), {"dev"})
+        self.assertIn("balanced", decision["splits"]["dev"])
 
-    def test_server_activate_failure_keeps_the_data(self):
+    def test_server_activate_failure_records_nothing_as_activated(self):
         self.put_job()
         self.r.client.activate = lambda *a: (_ for _ in ()).throw(ServerError(409, "parity_failed"))
         with self.assertRaises(ControlError):
             self.activate()
-        self.assertNotIn("delete_job_data", [c[0] for c in self.r.client.calls])
+        self.assertIsNone(self.saved()["activation"])
 
-    def test_unfinished_job_is_neither_decided_nor_deleted(self):
+    def test_unfinished_job_is_not_decided(self):
         self.put_job(status="evaluating")
         with self.assertRaises(ControlError):
             self.activate()
-        self.assertNotIn("delete_job_data", [c[0] for c in self.r.client.calls])
         self.assertNotIn("decision", self.saved())
 
     def test_job_that_is_not_the_submitted_one_is_refused(self):
@@ -120,7 +127,7 @@ class ActivateTests(unittest.TestCase):
             with self.assertRaises(ControlError, msg=field):
                 self.activate()
         self.assertNotIn("activate", [c[0] for c in self.r.client.calls])
-        self.assertNotIn("delete_job_data", [c[0] for c in self.r.client.calls])
+        self.assertEqual(self.deleted(), [])
 
     def test_version_zero_or_missing_is_refused(self):
         for version in (0, None, True):

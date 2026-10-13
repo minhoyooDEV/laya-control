@@ -39,7 +39,6 @@ class FakeClient:
         self.jobs_by_id = {} if jobs is None else jobs
         self.fail = fail
         self.calls = []
-        self.on_delete = None
 
     def _enter(self, name, *args):
         self.calls.append((name, *args))
@@ -71,12 +70,6 @@ class FakeClient:
         if job_id not in self.jobs_by_id:
             raise ServerError(404, "unknown_job")
         return self.jobs_by_id[job_id]
-
-    def delete_job_data(self, job_id):
-        self._enter("delete_job_data", job_id)
-        if self.on_delete:
-            self.on_delete(job_id)
-        return {"id": job_id, "data_deleted": True}
 
     def activate(self, task, version):
         self._enter("activate", task, version)

@@ -84,6 +84,10 @@ class RemoteCLITests(unittest.TestCase):
         code, out, err = self.run_cli("activate", "--remote", "--run-id", JOB_ID, "--reason", "Apply reviewed candidate")
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(out)["version"], 2)
+        shown = json.loads(out)["evaluation"]
+        self.assertEqual(shown["warnings"], [])
+        self.assertIn("edit", shown["splits"]["dev"]["balanced"])
+        self.assertIn("edit", shown["splits"]["test"]["balanced"])
 
     def test_local_activate_without_serving_arguments_is_refused_and_rollback_unchanged(self):
         code, _, err = self.run_cli("activate", "--run-id", JOB_ID, "--reason", "x")
