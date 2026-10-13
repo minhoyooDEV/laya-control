@@ -73,15 +73,23 @@ when the registered task schema differs from the snapshot schema. From the confi
 are sent; other keys are reported as `ignored_train_keys`. `device`, `mlx_python` and
 `--python`/`--base` are not used. `policy` is frozen into the job record at submit time.
 
-`activate --remote` takes the finished job's server metrics and applies the same policy
-as local runs against the base model, on dev and then, only if dev passed, on test:
-`min_accuracy`, per-class recall regression (`max_regression`), and rejection on any
-calibration issue, `temperature_at_bound` or failed parity. A dev-rejected job's test
-metrics are never read. Only a passing job is activated on the server. Once the decision
-is recorded locally (accepted or rejected), the job's server-side split data is deleted
-with `delete_job_data`; a failed delete is recorded and does not undo the decision. Generation and data-coverage checks are local-release features and do
-not apply. Per-class recall keys follow the local form (`edit:True`, `edit:False` for
-boolean questions).
+`activate --remote` takes the finished job's server metrics and gates them against the
+base model, on dev and then, only if dev passed, on test. A dev-rejected job's test metrics
+are never read. The rule differs from local runs: pooled accuracy must reach `min_accuracy`,
+and every question's balanced accuracy (mean recall of its classes) must be at least the
+base's minus `max_regression`. A per-class recall rule would block any model that learns to
+say "no" when the base nearly always says "yes". A binary question with a class of fewer than
+5 examples in the split is compared by plain accuracy instead (`candidate >= base - max_regression`)
+and gets the warning `<qid>: small class support (<5), compared by accuracy`. The server sends no
+per-class counts, so support is recovered from the integer hit counts that fit the rounded
+accuracy and recalls of both base and candidate (a `support` field is used if the server adds
+one, and a recall dict missing a class counts as small). Numbers that fit no integer counts
+stay on the balanced comparison. Parity must pass. A fitted temperature on the
+`[0.5, 5]` clamp, or `temperature_at_bound`, is recorded as a warning; any other calibration
+issue rejects. Only a passing job is activated on the server. The decision (balanced accuracies
+per question for candidate and base, reasons, warnings) is stored in the job record and printed
+under `evaluation`. Server-side job data is not deleted: the server keeps a cumulative dataset.
+Generation and data-coverage checks are local-release features and do not apply.
 
 A request ID is recorded before the upload. If the process dies mid-upload, the same
 request ID is refused until the server job list is checked; use a new request ID to
