@@ -18,7 +18,9 @@ def main(argv=None):
     default = os.environ.get("LAYA_CONTROL_HOME", str(Path.home() / ".local/state/laya-control"))
     parser.add_argument("--state-root", default=default)
     sub = parser.add_subparsers(dest="action", required=True)
-    sub.add_parser("status").add_argument("--json", action="store_true")
+    p = sub.add_parser("status")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--remote", action="store_true")
     sub.add_parser("reconcile")
     sub.add_parser("recover")
     p = sub.add_parser("submit")
@@ -39,25 +41,33 @@ def main(argv=None):
     p.add_argument("--config", required=True)
     p.add_argument("--owner", required=True)
     p.add_argument("--request-id", required=True)
-    p.add_argument("--python", required=True)
-    p.add_argument("--base", required=True)
+    p.add_argument("--python")
+    p.add_argument("--base")
+    p.add_argument("--remote", action="store_true")
     p = sub.add_parser("worker")
     p.add_argument("--drain", action="store_true")
     p = sub.add_parser("cancel")
     p.add_argument("--run-id", required=True)
     for name in ("activate", "rollback", "recover-activation"):
         p = sub.add_parser(name)
-        p.add_argument("--python", required=True)
-        p.add_argument("--socket", required=True)
+        local_only = name != "activate"  # activate --remote needs none of the local serving arguments
+        p.add_argument("--python", required=local_only)
+        p.add_argument("--socket", required=local_only)
         if name != "recover-activation":
             p.add_argument("--run-id" if name == "activate" else "--release-id", required=True)
-            p.add_argument("--expected-generation", type=int, required=True)
+            p.add_argument("--expected-generation", type=int, required=local_only)
             p.add_argument("--reason", required=True)
+        if name == "activate":
+            p.add_argument("--remote", action="store_true")
     args = parser.parse_args(argv)
     try:
         root = absolute(args.state_root)
         if args.action == "status":
             result = Store.read_status(root)
+            if args.remote and result.get("state") == "configured":
+                from .remote import make_remote, remote_status
+
+                result["remote"] = remote_status(root, make_remote)
         else:
             store = Store(root)
             if args.action == "submit":
@@ -84,10 +94,22 @@ def main(argv=None):
             elif args.action == "snapshot":
                 snap = store.snapshot(args.authorization_id, args.base_revision)
                 result = {k: v for k, v in snap.items() if k != "examples"}
+            elif args.action == "train" and args.remote:
+                from .remote import make_remote, submit_remote
+
+                result = submit_remote(
+                    store, make_remote(), args.snapshot, read(args.config), args.owner, args.request_id
+                )
+            elif args.action == "activate" and args.remote:
+                from .remote import activate_remote, make_remote
+
+                result = activate_remote(store, make_remote(), args.run_id, args.reason)
             elif args.action in ("enqueue", "train"):
                 from .jobs import enqueue
 
                 if args.action == "train":
+                    if not args.python or not args.base:
+                        raise ControlError("--python and --base are required unless --remote is given")
                     # Freeze the training policy alongside job state; later edits to the user's config cannot alter it.
                     from .store import atomic_json, digest
 
@@ -131,6 +153,12 @@ def main(argv=None):
                 from .releases import activate, recover_activation, rollback
                 from .server import ManagedService
 
+                if args.action == "activate" and (
+                    not args.python or not args.socket or args.expected_generation is None
+                ):
+                    raise ControlError(
+                        "--python, --socket and --expected-generation are required unless --remote"
+                    )
                 service = ManagedService(args.socket, args.python)
                 if args.action == "activate":
                     result = activate(store, args.run_id, args.expected_generation, args.reason, service)
