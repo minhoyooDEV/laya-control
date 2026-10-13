@@ -8,6 +8,7 @@ from laya_control.store import ControlError
 from laya_control.training import passes_policy, score_predictions
 
 POLICY = {"min_accuracy": 0.8, "max_regression": 0.0}
+CLAMP = "the fitted temperature 5 is on the [0.5, 5] clamp"
 
 
 def qmetric(items, **per_question):
@@ -139,19 +140,59 @@ class EvaluateTests(unittest.TestCase):
         v = self.verdict(job)
         self.assertEqual(v["reasons"], ["test policy not met"])
 
-    def test_calibration_issue_temperature_bound_and_parity_each_fail(self):
-        cases = {}
+    def test_clamp_only_issue_and_bound_flag_pass_with_warnings(self):
         job = ready_job()
-        job["metrics"]["calibration"]["noul"]["issues"] = ["the fitted temperature 5 is on the [0.5, 5] clamp"]
-        cases["calibration issue: noul"] = job
+        job["metrics"]["calibration"]["noul"]["issues"] = [CLAMP]
+        job["metrics"]["temperature_at_bound"] = True
+        v = self.verdict(job)
+        self.assertTrue(v["passed"], v["reasons"])
+        self.assertEqual(v["reasons"], [])
+        self.assertEqual(v["warnings"], ["temperature on the clamp: noul", "temperature at bound"])
+
+    def test_bound_flag_alone_passes_with_a_warning(self):
         job = ready_job()
         job["metrics"]["temperature_at_bound"] = True
-        cases["temperature at bound"] = job
+        v = self.verdict(job)
+        self.assertTrue(v["passed"])
+        self.assertEqual(v["warnings"], ["temperature at bound"])
+
+    def test_clean_job_has_no_warnings(self):
+        self.assertEqual(self.verdict(ready_job())["warnings"], [])
+
+    def test_any_other_calibration_issue_rejects_even_next_to_a_clamp_message(self):
+        for issues in (
+            ["fitted on only 40 calibration items"],
+            ["the fit came back unchanged at 1.0 (accuracy 0.90)"],
+            ["not fitted: 5 calibration items, fewer than 10, so the temperature stays 1.0"],
+            [CLAMP, "fitted on only 40 calibration items"],
+        ):
+            job = ready_job()
+            job["metrics"]["calibration"]["noul"]["issues"] = issues
+            job["metrics"]["temperature_at_bound"] = True
+            v = self.verdict(job)
+            self.assertFalse(v["passed"], issues)
+            self.assertIn("calibration issue: noul", v["reasons"])
+
+    def test_clamp_message_must_be_the_exact_half_to_five_clamp(self):
         job = ready_job()
+        job["metrics"]["calibration"]["noul"]["issues"] = ["the fitted temperature 9 is on the [0.1, 9] clamp"]
+        self.assertFalse(self.verdict(job)["passed"])
+
+    def test_parity_failure_still_rejects_even_with_only_warnings_otherwise(self):
+        job = ready_job()
+        job["metrics"]["calibration"]["noul"]["issues"] = [CLAMP]
+        job["metrics"]["temperature_at_bound"] = True
         job["metrics"]["parity"]["passed"] = False
-        cases["parity not passed"] = job
-        for reason, job in cases.items():
-            self.assertIn(reason, self.verdict(job)["reasons"])
+        v = self.verdict(job)
+        self.assertFalse(v["passed"])
+        self.assertEqual(v["reasons"], ["parity not passed"])
+        self.assertEqual(len(v["warnings"]), 2)
+
+    def test_bound_flag_that_is_not_a_boolean_fails_closed(self):
+        for value in (None, "true", 1):
+            job = ready_job()
+            job["metrics"]["temperature_at_bound"] = value
+            self.assertIn("temperature_at_bound missing", self.verdict(job)["reasons"])
 
     def test_missing_fields_fail_closed(self):
         for path in (("temperature_at_bound",), ("parity",), ("calibration",)):

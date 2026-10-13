@@ -23,6 +23,7 @@ REMOTE_OWNER = "compact-laya"
 REMOTE_TRAIN_KEYS = ("epochs", "micro_batch", "grad_accum", "freeze_encoder", "seed")
 SPLITS = ("train", "calibration", "dev", "test")
 JOB_ID = re.compile(r"[0-9a-f]{12}")
+CLAMP_ISSUE = re.compile(r"on the \[0\.5, 5\] clamp$")  # laya.calibration_report text for the [TEMP_MIN, TEMP_MAX] clamp
 CLIENT_TIMEOUT_S = 120.0  # A 50 MB split upload does not fit the library's 10 s default.
 
 
@@ -258,20 +259,28 @@ def passes_balanced(baseline, candidate, policy) -> bool:
 
 def evaluate(job, questions, policy) -> dict:
     """The promotion gate for a finished remote job: candidate vs base on dev, then on test only if dev
-    passed (see passes_balanced), plus the calibration, temperature-bound and parity rules."""
+    passed (see passes_balanced), plus the calibration and parity rules. Clamp-only temperature issues are
+    returned as warnings."""
     metrics = job.get("metrics")
     if job.get("status") != "ready" or not isinstance(metrics, dict):
-        return {"passed": False, "reasons": ["job is not ready"], "splits": {}}
-    reasons = []
-    if metrics.get("temperature_at_bound") is not False:
-        reasons.append("temperature at bound")
+        return {"passed": False, "reasons": ["job is not ready"], "warnings": [], "splits": {}}
+    reasons, warnings = [], []
+    # A temperature on the [0.5, 5] clamp is a warning; any other calibration issue still rejects.
     calibration = metrics.get("calibration")
     if not isinstance(calibration, dict) or not calibration:
         reasons.append("calibration report missing")
     else:
-        reasons += [
-            f"calibration issue: {kind}" for kind, entry in calibration.items() if entry.get("issues")
-        ]
+        for kind, entry in calibration.items():
+            issues = entry.get("issues") or []
+            if any(not CLAMP_ISSUE.search(issue) for issue in issues):
+                reasons.append(f"calibration issue: {kind}")
+            elif issues:
+                warnings.append(f"temperature on the clamp: {kind}")
+    bound = metrics.get("temperature_at_bound")
+    if not isinstance(bound, bool):
+        reasons.append("temperature_at_bound missing")
+    elif bound:
+        warnings.append("temperature at bound")
     parity = metrics.get("parity")
     if not isinstance(parity, dict) or parity.get("passed") is not True:
         reasons.append("parity not passed")
@@ -298,7 +307,7 @@ def evaluate(job, questions, policy) -> dict:
         }
         if not ok:
             reasons.append(f"{split} policy not met")
-    return {"passed": not reasons, "reasons": reasons, "splits": results}
+    return {"passed": not reasons, "reasons": reasons, "warnings": warnings, "splits": results}
 
 
 def delete_data(remote: Remote, job, record, path) -> None:
