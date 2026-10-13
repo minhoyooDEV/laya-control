@@ -10,6 +10,17 @@ from laya_control.training import passes_policy, score_predictions
 POLICY = {"min_accuracy": 0.8, "max_regression": 0.0}
 
 
+def qmetric(items, **per_question):
+    """Metric with (accuracy, true_recall, false_recall) per question."""
+    return {
+        "items": items,
+        "questions": {
+            q: {"accuracy": a, "ece": 0.05, "recall": {"true": t, "false": f}}
+            for q, (a, t, f) in per_question.items()
+        },
+    }
+
+
 class ToScoreTests(unittest.TestCase):
     def test_noul_labels_become_python_bool_keys_like_score_predictions(self):
         score = remote.to_score(metric(0.9, true_recall=0.7, false_recall=0.95, items=10), QUESTIONS)
@@ -59,13 +70,41 @@ class EvaluateTests(unittest.TestCase):
         v = self.verdict(ready_job(candidate=0.85, base=0.9))
         self.assertIn("dev policy not met", v["reasons"])
 
-    def test_single_class_recall_regression_fails_despite_better_accuracy(self):
+    def test_always_yes_base_no_longer_blocks_a_better_model(self):
+        job = ready_job(candidate=0.9, base=0.5)
+        for split in ("dev", "test"):
+            items = job["metrics"]["splits"][split]["base"]["items"]
+            job["metrics"]["splits"][split]["base"] = metric(0.5, true_recall=1.0, false_recall=0.0, items=items)
+            job["metrics"]["splits"][split]["candidate"] = metric(0.9, true_recall=0.8, false_recall=0.95, items=items)
+        base = remote.to_score(job["metrics"]["splits"]["dev"]["base"], QUESTIONS)
+        cand = remote.to_score(job["metrics"]["splits"]["dev"]["candidate"], QUESTIONS)
+        self.assertFalse(passes_policy(base, cand, POLICY))  # the per-class recall rule used to reject this
+        v = self.verdict(job)
+        self.assertTrue(v["passed"], v["reasons"])
+        self.assertAlmostEqual(v["splits"]["dev"]["balanced"]["edit"]["base"], 0.5)
+        self.assertAlmostEqual(v["splits"]["dev"]["balanced"]["edit"]["candidate"], 0.875)
+
+    def test_one_question_with_lower_balanced_accuracy_fails_despite_better_pooled_accuracy(self):
         job = ready_job(candidate=0.9, base=0.8)
         for split in ("dev", "test"):
-            job["metrics"]["splits"][split]["candidate"] = metric(0.95, true_recall=0.7, false_recall=1.0,
-                                                                  items=job["metrics"]["splits"][split]["base"]["items"])
-            job["metrics"]["splits"][split]["base"] = metric(0.8, true_recall=0.8, false_recall=0.8,
-                                                             items=job["metrics"]["splits"][split]["base"]["items"])
+            items = job["metrics"]["splits"][split]["base"]["items"]
+            job["metrics"]["splits"][split]["base"] = qmetric(items, edit=(0.8, 0.8, 0.8), pr=(0.5, 0.5, 0.5))
+            job["metrics"]["splits"][split]["candidate"] = qmetric(items, edit=(0.9, 0.6, 0.9), pr=(0.95, 0.95, 0.95))
+        v = self.verdict(job)
+        self.assertEqual(v["reasons"], ["dev policy not met"])
+        self.assertAlmostEqual(v["splits"]["dev"]["balanced"]["edit"]["candidate"], 0.75)
+        self.assertGreater(v["splits"]["dev"]["candidate_accuracy"], v["splits"]["dev"]["baseline_accuracy"])
+
+    def test_max_regression_is_the_balanced_accuracy_tolerance(self):
+        job = ready_job(candidate=0.9, base=0.8)
+        job["metrics"]["splits"]["dev"]["base"] = qmetric(45, edit=(0.9, 0.9, 0.9), pr=(0.9, 0.9, 0.9))
+        job["metrics"]["splits"]["dev"]["candidate"] = qmetric(45, edit=(0.9, 0.87, 0.87), pr=(0.9, 0.9, 0.9))
+        self.assertFalse(remote.evaluate(job, QUESTIONS, POLICY)["passed"])
+        loose = {"min_accuracy": 0.8, "max_regression": 0.05}
+        self.assertTrue(remote.evaluate(job, QUESTIONS, loose)["passed"])
+
+    def test_pooled_accuracy_below_minimum_fails_even_when_balanced_accuracy_improves(self):
+        job = ready_job(candidate=0.79, base=0.5)
         self.assertFalse(self.verdict(job)["passed"])
 
     def test_dev_rejected_job_never_reads_the_test_split(self):
@@ -130,12 +169,15 @@ class EvaluateTests(unittest.TestCase):
         self.assertFalse(self.verdict(ready_job(status="evaluating"))["passed"])
         self.assertFalse(self.verdict(ready_job(metrics=None))["passed"])
 
-    def test_gate_is_identical_to_passes_policy_on_mapped_scores(self):
-        job = ready_job(candidate=0.9, base=0.8)
-        base = remote.to_score(job["metrics"]["splits"]["dev"]["base"], QUESTIONS)
-        cand = remote.to_score(job["metrics"]["splits"]["dev"]["candidate"], QUESTIONS)
-        self.assertEqual(passes_policy(base, cand, POLICY), self.verdict(copy.deepcopy(job))["splits"]["dev"]["passed"])
-
+    def test_balanced_gate_matches_a_hand_computed_table(self):
+        base = remote.to_score(qmetric(10, edit=(0.5, 1.0, 0.0), pr=(0.6, 0.7, 0.5)), QUESTIONS)
+        cand = remote.to_score(qmetric(10, edit=(0.9, 0.8, 1.0), pr=(0.8, 0.8, 0.8)), QUESTIONS)
+        self.assertEqual(base["balanced"], {"edit": 0.5, "pr": 0.6})
+        self.assertEqual(cand["balanced"], {"edit": 0.9, "pr": 0.8})
+        self.assertTrue(remote.passes_balanced(base, cand, POLICY))
+        self.assertFalse(remote.passes_balanced(cand, base, POLICY))
+        self.assertFalse(remote.passes_balanced(base, dict(cand, count=1), POLICY))
+        self.assertFalse(remote.passes_balanced(dict(base, count=0), dict(cand, count=0), POLICY))
 
 if __name__ == "__main__":
     unittest.main()

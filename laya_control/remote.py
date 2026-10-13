@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .store import ControlError, Store, absolute, atomic_json, canonical, digest
-from .training import passes_policy, rows_for
+from .training import rows_for
 
 REMOTE_TASK = "compact-laya-focus-v2"
 REMOTE_OWNER = "compact-laya"
@@ -200,11 +200,12 @@ def submit_remote(store: Store, remote: Remote, snapshot_id, cfg, owner, request
 
 
 def to_score(metric, questions) -> dict:
-    """Map a server metric M to the shape passes_policy expects.
+    """Map a server metric M to a score dict.
 
     Accuracy is the mean of per-question accuracies (every question has the same item count, so this
     equals the pooled accuracy). Recall keys follow score_predictions: "<qid>:<expected>", where a noul
-    expectation is a Python bool, so the server labels "true"/"false" become "True"/"False".
+    expectation is a Python bool, so the server labels "true"/"false" become "True"/"False". "balanced"
+    maps each question to the mean recall of the classes the server reported for it.
     """
     try:
         items = metric["items"]
@@ -213,10 +214,12 @@ def to_score(metric, questions) -> dict:
             raise ControlError("metrics report no evaluated items")
         if set(by_question) != set(questions):
             raise ControlError("metrics questions differ from the snapshot schema")
-        accuracies, recall = [], {}
+        accuracies, recall, balanced = [], {}, {}
         for qid, definition in questions.items():
             kind = definition["type"]
             accuracies.append(float(by_question[qid]["accuracy"]))
+            if not by_question[qid]["recall"]:
+                raise ControlError("metrics have no per-class recall; the balanced gate would be vacuous")
             for label, value in by_question[qid]["recall"].items():
                 if kind == "noul" and label in ("true", "false"):
                     name = f"{qid}:{label == 'true'}"
@@ -225,23 +228,37 @@ def to_score(metric, questions) -> dict:
                 else:
                     raise ControlError("remote gate supports choice and noul only")
                 recall[name] = float(value)
+            balanced[qid] = sum(float(v) for v in by_question[qid]["recall"].values()) / len(
+                by_question[qid]["recall"]
+            )
     except (KeyError, TypeError, ValueError, AttributeError):
         raise ControlError("malformed remote metrics") from None
-    if not recall:
-        raise ControlError("metrics have no per-class recall; the regression gate would be vacuous")
     if not all(math.isfinite(x) for x in [*accuracies, *recall.values()]):
         raise ControlError("non-finite remote metrics")
     return {
         "accuracy": sum(accuracies) / len(accuracies),
         "count": items * len(questions),
         "per_class_recall": recall,
+        "balanced": balanced,
         "confusion": {},
     }
 
 
+def passes_balanced(baseline, candidate, policy) -> bool:
+    """Pooled accuracy must reach min_accuracy and no question's balanced accuracy (mean per-class recall)
+    may fall below the base's by more than max_regression. A base that answers one class almost always
+    has true-class recall near 1.0, which a per-class rule would treat as untouchable."""
+    if not baseline["count"] or candidate["count"] != baseline["count"]:
+        return False
+    if candidate["accuracy"] < policy.get("min_accuracy", 0.8):
+        return False
+    delta = policy.get("max_regression", 0)
+    return all(candidate["balanced"].get(q, -1) >= v - delta for q, v in baseline["balanced"].items())
+
+
 def evaluate(job, questions, policy) -> dict:
     """The promotion gate for a finished remote job: candidate vs base on dev, then on test only if dev
-    passed, plus the calibration, temperature-bound and parity rules the local adapter applies."""
+    passed (see passes_balanced), plus the calibration, temperature-bound and parity rules."""
     metrics = job.get("metrics")
     if job.get("status") != "ready" or not isinstance(metrics, dict):
         return {"passed": False, "reasons": ["job is not ready"], "splits": {}}
@@ -269,10 +286,14 @@ def evaluate(job, questions, policy) -> dict:
             break
         baseline = to_score(entry["base"], questions)
         candidate = to_score(entry["candidate"], questions)
-        ok = passes_policy(baseline, candidate, policy)
+        ok = passes_balanced(baseline, candidate, policy)
         results[split] = {
             "baseline_accuracy": baseline["accuracy"],
             "candidate_accuracy": candidate["accuracy"],
+            "balanced": {
+                q: {"base": baseline["balanced"][q], "candidate": candidate["balanced"][q]}
+                for q in baseline["balanced"]
+            },
             "passed": ok,
         }
         if not ok:
