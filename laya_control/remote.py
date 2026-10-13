@@ -24,6 +24,8 @@ REMOTE_TRAIN_KEYS = ("epochs", "micro_batch", "grad_accum", "freeze_encoder", "s
 SPLITS = ("train", "calibration", "dev", "test")
 JOB_ID = re.compile(r"[0-9a-f]{12}")
 CLAMP_ISSUE = re.compile(r"on the \[0\.5, 5\] clamp$")  # laya.calibration_report text for the [TEMP_MIN, TEMP_MAX] clamp
+MIN_SUPPORT = 5  # a class with fewer examples than this in a split is too small for a recall comparison
+ROUNDING = 6e-5  # the server reports accuracy and recall rounded to 4 decimals
 CLIENT_TIMEOUT_S = 120.0  # A 50 MB split upload does not fit the library's 10 s default.
 
 
@@ -200,13 +202,45 @@ def submit_remote(store: Store, remote: Remote, snapshot_id, cfg, owner, request
 
 
 
+def feasible_positives(items, accuracy, true_recall, false_recall) -> set:
+    """Positive-class sizes consistent with a binary question's rounded accuracy and recalls.
+
+    The server sends no per-class counts, so support is recovered from integers: with P positives and
+    items - P negatives, true_recall * P and false_recall * (items - P) must be whole hit counts whose sum
+    over items is the accuracy.
+    """
+    found = set()
+    for positives in range(1, items):
+        negatives = items - positives
+        true_hits, false_hits = round(true_recall * positives), round(false_recall * negatives)
+        if (
+            abs(true_hits / positives - true_recall) <= ROUNDING
+            and abs(false_hits / negatives - false_recall) <= ROUNDING
+            and abs((true_hits + false_hits) / items - accuracy) <= ROUNDING
+        ):
+            found.add(positives)
+    return found
+
+
+def explicit_positives(entry, items):
+    """Positive count from an explicit {"support": {"true": a, "false": b}} field, if it adds up."""
+    support = entry.get("support")
+    if not isinstance(support, dict):
+        return None
+    a, b = support.get("true"), support.get("false")
+    ints = all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in (a, b))
+    return {a} if ints and a + b == items else None
+
+
 def to_score(metric, questions) -> dict:
     """Map a server metric M to a score dict.
 
     Accuracy is the mean of per-question accuracies (every question has the same item count, so this
     equals the pooled accuracy). Recall keys follow score_predictions: "<qid>:<expected>", where a noul
     expectation is a Python bool, so the server labels "true"/"false" become "True"/"False". "balanced"
-    maps each question to the mean recall of the classes the server reported for it.
+    maps each question to the mean recall of the classes the server reported for it. For noul questions,
+    "positives" holds the possible positive-class sizes (None when they cannot be determined) and
+    "partial" lists questions whose recall dict lacks a class.
     """
     try:
         items = metric["items"]
@@ -216,9 +250,11 @@ def to_score(metric, questions) -> dict:
         if set(by_question) != set(questions):
             raise ControlError("metrics questions differ from the snapshot schema")
         accuracies, recall, balanced = [], {}, {}
+        question_accuracy, positives, partial = {}, {}, set()
         for qid, definition in questions.items():
             kind = definition["type"]
             accuracies.append(float(by_question[qid]["accuracy"]))
+            question_accuracy[qid] = accuracies[-1]
             if not by_question[qid]["recall"]:
                 raise ControlError("metrics have no per-class recall; the balanced gate would be vacuous")
             for label, value in by_question[qid]["recall"].items():
@@ -229,6 +265,14 @@ def to_score(metric, questions) -> dict:
                 else:
                     raise ControlError("remote gate supports choice and noul only")
                 recall[name] = float(value)
+            if kind == "noul":
+                entry = by_question[qid]
+                if set(entry["recall"]) != {"true", "false"}:
+                    partial.add(qid)
+                else:
+                    positives[qid] = explicit_positives(entry, items) or feasible_positives(
+                        items, accuracies[-1], float(entry["recall"]["true"]), float(entry["recall"]["false"])
+                    )
             balanced[qid] = sum(float(v) for v in by_question[qid]["recall"].values()) / len(
                 by_question[qid]["recall"]
             )
@@ -241,20 +285,52 @@ def to_score(metric, questions) -> dict:
         "count": items * len(questions),
         "per_class_recall": recall,
         "balanced": balanced,
+        "question_accuracy": question_accuracy,
+        "items": items,
+        "positives": positives,
+        "partial": partial,
         "confusion": {},
     }
 
 
-def passes_balanced(baseline, candidate, policy) -> bool:
+def small_questions(baseline, candidate) -> set:
+    """Questions with a class under MIN_SUPPORT examples in the split.
+
+    A recall dict lacking a class counts as small. Otherwise the positive-class size must be certain:
+    every size consistent with both the base and the candidate numbers is below MIN_SUPPORT on one side.
+    Numbers that fit no integer counts leave the question on the stricter balanced comparison.
+    """
+    items, small = baseline["items"], set()
+    for qid in baseline["balanced"]:
+        if qid in baseline["partial"] or qid in candidate["partial"]:
+            small.add(qid)
+            continue
+        sizes = baseline["positives"].get(qid)
+        other = candidate["positives"].get(qid)
+        common = (sizes & other) if sizes and other else set()
+        if common and all(min(p, items - p) < MIN_SUPPORT for p in common):
+            small.add(qid)
+    return small
+
+
+def passes_balanced(baseline, candidate, policy, small=frozenset()) -> bool:
     """Pooled accuracy must reach min_accuracy and no question's balanced accuracy (mean per-class recall)
     may fall below the base's by more than max_regression. A base that answers one class almost always
-    has true-class recall near 1.0, which a per-class rule would treat as untouchable."""
+    has true-class recall near 1.0, which a per-class rule would treat as untouchable. Questions in
+    `small` (a class too rare for a recall) are compared by plain accuracy instead."""
     if not baseline["count"] or candidate["count"] != baseline["count"]:
         return False
     if candidate["accuracy"] < policy.get("min_accuracy", 0.8):
         return False
     delta = policy.get("max_regression", 0)
-    return all(candidate["balanced"].get(q, -1) >= v - delta for q, v in baseline["balanced"].items())
+    for qid, value in baseline["balanced"].items():
+        if qid in small:
+            ok = candidate["question_accuracy"][qid] >= baseline["question_accuracy"][qid] - delta
+        else:
+            ok = candidate["balanced"].get(qid, -1) >= value - delta
+        if not ok:
+            return False
+    return True
 
 
 def evaluate(job, questions, policy) -> dict:
@@ -295,16 +371,25 @@ def evaluate(job, questions, policy) -> dict:
             break
         baseline = to_score(entry["base"], questions)
         candidate = to_score(entry["candidate"], questions)
-        ok = passes_balanced(baseline, candidate, policy)
+        small = small_questions(baseline, candidate)
+        ok = passes_balanced(baseline, candidate, policy, small)
         results[split] = {
             "baseline_accuracy": baseline["accuracy"],
             "candidate_accuracy": candidate["accuracy"],
             "balanced": {
-                q: {"base": baseline["balanced"][q], "candidate": candidate["balanced"][q]}
+                q: {
+                    "metric": "accuracy" if q in small else "balanced",
+                    "base": (baseline["question_accuracy"] if q in small else baseline["balanced"])[q],
+                    "candidate": (candidate["question_accuracy"] if q in small else candidate["balanced"])[q],
+                }
                 for q in baseline["balanced"]
             },
             "passed": ok,
         }
+        for qid in baseline["balanced"]:
+            note = f"{qid}: small class support (<{MIN_SUPPORT}), compared by accuracy"
+            if qid in small and note not in warnings:
+                warnings.append(note)
         if not ok:
             reasons.append(f"{split} policy not met")
     return {"passed": not reasons, "reasons": reasons, "warnings": warnings, "splits": results}

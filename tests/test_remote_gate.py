@@ -21,6 +21,22 @@ def qmetric(items, **per_question):
     }
 
 
+def counted(items, **per_question):
+    """Metric built from integer counts: question -> (positives, true_hits, false_hits), server-rounded."""
+    questions = {}
+    for q, (positives, true_hits, false_hits) in per_question.items():
+        negatives = items - positives
+        questions[q] = {
+            "accuracy": round((true_hits + false_hits) / items, 4),
+            "ece": 0.1,
+            "recall": {"true": round(true_hits / positives, 4), "false": round(false_hits / negatives, 4)},
+        }
+    return {"items": items, "questions": questions}
+
+
+SMALL = "pr: small class support (<5), compared by accuracy"
+
+
 class ToScoreTests(unittest.TestCase):
     def test_noul_labels_become_python_bool_keys_like_score_predictions(self):
         score = remote.to_score(metric(0.9, true_recall=0.7, false_recall=0.95, items=10), QUESTIONS)
@@ -57,6 +73,98 @@ class ToScoreTests(unittest.TestCase):
 class EvaluateTests(unittest.TestCase):
     def verdict(self, job):
         return remote.evaluate(job, QUESTIONS, POLICY)
+
+    def job_with_test(self, base, candidate, dev=None):
+        job = ready_job(candidate=0.9, base=0.8)
+        job["metrics"]["splits"]["test"]["base"] = base
+        job["metrics"]["splits"]["test"]["candidate"] = candidate
+        if dev:
+            job["metrics"]["splits"]["dev"]["base"], job["metrics"]["splits"]["dev"]["candidate"] = dev
+        return job
+
+    def deploy_like(self, positives=1, base_hits=(1, 2), cand_hits=(0, 45)):
+        n = 46
+        negatives = n - positives
+        base = counted(n, edit=(20, 20, 2), pr=(positives, base_hits[0], base_hits[1]))
+        cand = counted(n, edit=(20, 17, 24), pr=(positives, cand_hits[0], cand_hits[1]))
+        assert negatives >= cand_hits[1]
+        return base, cand
+
+    def test_deploy_like_single_positive_missed_passes_by_accuracy_with_a_warning(self):
+        base, cand = self.deploy_like()
+        sb, sc = remote.to_score(base, QUESTIONS), remote.to_score(cand, QUESTIONS)
+        self.assertFalse(remote.passes_balanced(sb, sc, POLICY))  # balanced accuracy alone would reject
+        v = self.verdict(self.job_with_test(base, cand))
+        self.assertTrue(v["passed"], v["reasons"])
+        self.assertEqual(v["warnings"], [SMALL])
+        row = v["splits"]["test"]["balanced"]["pr"]
+        self.assertEqual(row["metric"], "accuracy")
+        self.assertAlmostEqual(row["candidate"], 0.9783, places=4)
+        self.assertAlmostEqual(row["base"], 0.0652, places=4)
+        self.assertEqual(v["splits"]["test"]["balanced"]["edit"]["metric"], "balanced")
+
+    def test_small_support_question_still_fails_when_its_accuracy_regresses(self):
+        base, cand = self.deploy_like(base_hits=(0, 45), cand_hits=(0, 43))
+        v = self.verdict(self.job_with_test(base, cand))
+        self.assertEqual(v["reasons"], ["test policy not met"])
+        self.assertEqual(v["warnings"], [SMALL])
+
+    def test_max_regression_applies_to_the_accuracy_comparison(self):
+        base, cand = self.deploy_like(base_hits=(0, 45), cand_hits=(0, 44))
+        job = self.job_with_test(base, cand)
+        self.assertFalse(self.verdict(job)["passed"])
+        loose = {"min_accuracy": 0.8, "max_regression": 0.05}
+        self.assertTrue(remote.evaluate(job, QUESTIONS, loose)["passed"])
+
+    def test_support_of_four_is_small_and_five_is_not(self):
+        base, cand = self.deploy_like(positives=4, base_hits=(4, 2), cand_hits=(0, 42))
+        v = self.verdict(self.job_with_test(base, cand))
+        self.assertTrue(v["passed"], v["reasons"])
+        self.assertEqual(v["warnings"], [SMALL])
+        base, cand = self.deploy_like(positives=5, base_hits=(5, 5), cand_hits=(0, 41))
+        v = self.verdict(self.job_with_test(base, cand))
+        self.assertEqual(v["reasons"], ["test policy not met"])
+        self.assertEqual(v["warnings"], [])
+        self.assertEqual(v["splits"]["test"]["balanced"]["pr"]["metric"], "balanced")
+
+    def test_warning_is_listed_once_when_dev_and_test_are_both_small(self):
+        base, cand = self.deploy_like()
+        v = self.verdict(self.job_with_test(base, cand, dev=(base, cand)))
+        self.assertTrue(v["passed"], v["reasons"])
+        self.assertEqual(v["warnings"], [SMALL])
+        self.assertEqual(v["splits"]["dev"]["balanced"]["pr"]["metric"], "accuracy")
+
+    def test_class_missing_from_the_recall_dict_counts_as_small(self):
+        job = ready_job(candidate=0.9, base=0.5)
+        for side, acc in (("base", 0.5), ("candidate", 0.95)):
+            job["metrics"]["splits"]["test"][side]["questions"]["pr"] = {
+                "accuracy": acc, "ece": 0.1, "recall": {"false": acc}
+            }
+        v = self.verdict(job)
+        self.assertTrue(v["passed"], v["reasons"])
+        self.assertEqual(v["warnings"], [SMALL])
+
+    def test_explicit_support_from_the_server_is_used_when_present(self):
+        job = ready_job(candidate=0.9, base=0.5)
+        for side in ("base", "candidate"):
+            entry = job["metrics"]["splits"]["test"][side]["questions"]["pr"]
+            entry["support"] = {"true": 3, "false": 43}
+        v = self.verdict(job)
+        self.assertEqual(v["warnings"], [SMALL])
+        job["metrics"]["splits"]["test"]["candidate"]["questions"]["pr"]["support"] = {"true": 3, "false": 99}
+        self.assertEqual(self.verdict(job)["warnings"], [])  # counts that do not add up are ignored
+
+    def test_numbers_that_fit_no_integer_counts_fall_back_to_balanced(self):
+        base = metric(0.6, true_recall=0.9, false_recall=0.3, items=46)
+        cand = metric(0.95, true_recall=0.2, false_recall=0.97, items=46)
+        v = self.verdict(self.job_with_test(base, cand))
+        self.assertEqual(v["warnings"], [])
+        self.assertEqual(v["reasons"], ["test policy not met"])
+
+    def test_choice_questions_are_never_treated_as_small(self):
+        questions = {"screen": {"type": "choice", "criteria": ["home", "pdp"]}}
+        m = {"items": 46, "questions": {"screen": {"accuracy": 0.9783, "ece": 0.1, "recall": {"home": 0.0, "pdp": 1.0}}}}
+        self.assertEqual(remote.to_score(m, questions)["positives"], {})
 
     def test_good_candidate_passes_dev_and_test(self):
         v = self.verdict(ready_job(candidate=0.9, base=0.8))

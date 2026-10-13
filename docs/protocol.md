@@ -78,7 +78,13 @@ base model, on dev and then, only if dev passed, on test. A dev-rejected job's t
 are never read. The rule differs from local runs: pooled accuracy must reach `min_accuracy`,
 and every question's balanced accuracy (mean recall of its classes) must be at least the
 base's minus `max_regression`. A per-class recall rule would block any model that learns to
-say "no" when the base nearly always says "yes". Parity must pass. A fitted temperature on the
+say "no" when the base nearly always says "yes". A binary question with a class of fewer than
+5 examples in the split is compared by plain accuracy instead (`candidate >= base - max_regression`)
+and gets the warning `<qid>: small class support (<5), compared by accuracy`. The server sends no
+per-class counts, so support is recovered from the integer hit counts that fit the rounded
+accuracy and recalls of both base and candidate (a `support` field is used if the server adds
+one, and a recall dict missing a class counts as small). Numbers that fit no integer counts
+stay on the balanced comparison. Parity must pass. A fitted temperature on the
 `[0.5, 5]` clamp, or `temperature_at_bound`, is recorded as a warning; any other calibration
 issue rejects. Only a passing job is activated on the server. The decision (balanced accuracies
 per question for candidate and base, reasons, warnings) is stored in the job record and printed
